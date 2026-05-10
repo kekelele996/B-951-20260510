@@ -147,6 +147,24 @@ class TaskController
     $performanceWeight = max(1, min(10, (int) ($input['performance_weight'] ?? $task->performance_weight)));
     $dueDate = (string) ($input['due_date'] ?? ($task->due_date ? $task->due_date->format('Y-m-d') : ''));
 
+    $userId = (int) $task->user_id;
+    $oldWeight = (int) $task->performance_weight;
+    $isScored = (string) $task->status === 'scored';
+
+    $affectedMonths = [];
+    if ($isScored && $oldWeight !== $performanceWeight) {
+      $scores = TaskScore::query()->where('task_id', $task->id)->get();
+      foreach ($scores as $score) {
+        $ts = strtotime((string) $score->created_at);
+        if ($ts !== false) {
+          $key = date('Y-m', $ts);
+          if (!isset($affectedMonths[$key])) {
+            $affectedMonths[$key] = ['year' => (int) date('Y', $ts), 'month' => (int) date('m', $ts)];
+          }
+        }
+      }
+    }
+
     $task->fill([
       'title' => $title,
       'description' => $description,
@@ -155,6 +173,12 @@ class TaskController
       'due_date' => $dueDate,
     ]);
     $task->save();
+
+    if ($isScored && $oldWeight !== $performanceWeight && !empty($affectedMonths)) {
+      foreach ($affectedMonths as $m) {
+        $this->updatePerformance($userId, $m['year'], $m['month']);
+      }
+    }
 
     Response::success($task->toArray(), '任务更新成功');
   }
@@ -173,7 +197,30 @@ class TaskController
       Response::error('无权删除此任务', 403);
     }
 
+    $userId = (int) $task->user_id;
+    $wasScored = (string) $task->status === 'scored';
+
+    $scores = TaskScore::query()->where('task_id', $task->id)->get();
+    $affectedMonths = [];
+    foreach ($scores as $score) {
+      $ts = strtotime((string) $score->created_at);
+      if ($ts !== false) {
+        $key = date('Y-m', $ts);
+        if (!isset($affectedMonths[$key])) {
+          $affectedMonths[$key] = ['year' => (int) date('Y', $ts), 'month' => (int) date('m', $ts)];
+        }
+      }
+    }
+
+    TaskScore::query()->where('task_id', $task->id)->delete();
+
     $task->delete();
+
+    if ($wasScored && !empty($affectedMonths)) {
+      foreach ($affectedMonths as $m) {
+        $this->updatePerformance($userId, $m['year'], $m['month']);
+      }
+    }
 
     Response::success(null, '任务删除成功');
   }
@@ -199,9 +246,33 @@ class TaskController
       Response::error('无权修改此任务', 403);
     }
 
+    $userId = (int) $task->user_id;
+    $oldStatus = (string) $task->status;
+
+    $affectedMonths = [];
+    if ($oldStatus === 'scored' && $status !== 'scored') {
+      $scores = TaskScore::query()->where('task_id', $task->id)->get();
+      foreach ($scores as $score) {
+        $ts = strtotime((string) $score->created_at);
+        if ($ts !== false) {
+          $key = date('Y-m', $ts);
+          if (!isset($affectedMonths[$key])) {
+            $affectedMonths[$key] = ['year' => (int) date('Y', $ts), 'month' => (int) date('m', $ts)];
+          }
+        }
+      }
+      TaskScore::query()->where('task_id', $task->id)->delete();
+    }
+
     $task->status = $status;
     $task->completed_at = $status === 'completed' ? date('Y-m-d H:i:s') : null;
     $task->save();
+
+    if ($oldStatus === 'scored' && !empty($affectedMonths)) {
+      foreach ($affectedMonths as $m) {
+        $this->updatePerformance($userId, $m['year'], $m['month']);
+      }
+    }
 
     Response::success($task->toArray(), '状态更新成功');
   }
@@ -229,8 +300,13 @@ class TaskController
       Response::error('只能评分已完成的任务');
     }
 
+    $affectedMonths = [];
     $existing = TaskScore::query()->where('task_id', $task->id)->first();
     if ($existing) {
+      $ts = strtotime((string) $existing->created_at);
+      if ($ts !== false) {
+        $affectedMonths[] = ['year' => (int) date('Y', $ts), 'month' => (int) date('m', $ts)];
+      }
       $existing->fill([
         'score' => $score,
         'comment' => $comment,
@@ -238,28 +314,59 @@ class TaskController
       ]);
       $existing->save();
     } else {
-      TaskScore::create([
+      $newScore = TaskScore::create([
         'task_id' => $task->id,
         'scorer_id' => (int) $user['id'],
         'score' => $score,
         'comment' => $comment,
       ]);
+      $ts = strtotime((string) $newScore->created_at);
+      if ($ts !== false) {
+        $affectedMonths[] = ['year' => (int) date('Y', $ts), 'month' => (int) date('m', $ts)];
+      }
     }
 
     $task->status = 'scored';
     $task->save();
 
-    // Update performance
-    $this->updatePerformance((int) $task->user_id);
+    if (!empty($affectedMonths)) {
+      foreach ($affectedMonths as $m) {
+        $this->updatePerformance((int) $task->user_id, $m['year'], $m['month']);
+      }
+    }
 
     Response::success(null, '评分成功');
   }
 
-  private function updatePerformance(int $userId): void
+  private function updatePerformance(int $userId, ?int $year = null, ?int $month = null): void
   {
-    $year = (int) date('Y');
-    $month = (int) date('m');
+    $months = [];
 
+    if ($year !== null && $month !== null) {
+      $months[] = ['year' => $year, 'month' => $month];
+    } else {
+      $distinctMonths = TaskScore::query()
+        ->whereHas('task', function ($q) use ($userId) {
+          $q->where('user_id', $userId);
+        })
+        ->selectRaw('YEAR(created_at) as year, MONTH(created_at) as month')
+        ->groupBy('year', 'month')
+        ->orderByDesc('year')
+        ->orderByDesc('month')
+        ->get();
+
+      foreach ($distinctMonths as $row) {
+        $months[] = ['year' => (int) $row->year, 'month' => (int) $row->month];
+      }
+    }
+
+    foreach ($months as $m) {
+      $this->calculateMonthPerformance($userId, $m['year'], $m['month']);
+    }
+  }
+
+  private function calculateMonthPerformance(int $userId, int $year, int $month): void
+  {
     $start = new DateTimeImmutable(sprintf('%04d-%02d-01 00:00:00', $year, $month));
     $end = $start->modify('first day of next month');
 
