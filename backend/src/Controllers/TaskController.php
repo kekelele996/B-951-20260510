@@ -147,6 +147,9 @@ class TaskController
     $performanceWeight = max(1, min(10, (int) ($input['performance_weight'] ?? $task->performance_weight)));
     $dueDate = (string) ($input['due_date'] ?? ($task->due_date ? $task->due_date->format('Y-m-d') : ''));
 
+    $weightChanged = (int) $task->performance_weight !== $performanceWeight;
+    $isScored = (string) $task->status === 'scored';
+
     $task->fill([
       'title' => $title,
       'description' => $description,
@@ -155,6 +158,10 @@ class TaskController
       'due_date' => $dueDate,
     ]);
     $task->save();
+
+    if ($isScored && $weightChanged) {
+      $this->recalcPerformanceForTask($task);
+    }
 
     Response::success($task->toArray(), '任务更新成功');
   }
@@ -173,7 +180,24 @@ class TaskController
       Response::error('无权删除此任务', 403);
     }
 
+    $needRecalc = (string) $task->status === 'scored';
+    $score = TaskScore::query()->where('task_id', $task->id)->first();
+    $recalcMonth = null;
+    if ($score && $score->created_at) {
+      $d = new DateTimeImmutable($score->created_at);
+      $recalcMonth = ['year' => (int) $d->format('Y'), 'month' => (int) $d->format('m')];
+    }
+    $userId = (int) $task->user_id;
+
     $task->delete();
+
+    if ($needRecalc) {
+      if ($recalcMonth) {
+        $this->updatePerformance($userId, $recalcMonth['year'], $recalcMonth['month']);
+      } else {
+        $this->updatePerformance($userId);
+      }
+    }
 
     Response::success(null, '任务删除成功');
   }
@@ -199,9 +223,17 @@ class TaskController
       Response::error('无权修改此任务', 403);
     }
 
+    $oldStatus = (string) $task->status;
+    $needRecalc = ($oldStatus === 'scored' && $status !== 'scored')
+      || ($oldStatus !== 'scored' && $status === 'scored');
+
     $task->status = $status;
     $task->completed_at = $status === 'completed' ? date('Y-m-d H:i:s') : null;
     $task->save();
+
+    if ($needRecalc) {
+      $this->recalcPerformanceForTask($task);
+    }
 
     Response::success($task->toArray(), '状态更新成功');
   }
@@ -249,16 +281,20 @@ class TaskController
     $task->status = 'scored';
     $task->save();
 
-    // Update performance
-    $this->updatePerformance((int) $task->user_id);
+    if ($existing && $existing->created_at) {
+      $d = new DateTimeImmutable($existing->created_at);
+      $this->updatePerformance((int) $task->user_id, (int) $d->format('Y'), (int) $d->format('m'));
+    } else {
+      $this->updatePerformance((int) $task->user_id);
+    }
 
     Response::success(null, '评分成功');
   }
 
-  private function updatePerformance(int $userId): void
+  private function updatePerformance(int $userId, ?int $year = null, ?int $month = null): void
   {
-    $year = (int) date('Y');
-    $month = (int) date('m');
+    $year = $year ?? (int) date('Y');
+    $month = $month ?? (int) date('m');
 
     $start = new DateTimeImmutable(sprintf('%04d-%02d-01 00:00:00', $year, $month));
     $end = $start->modify('first day of next month');
@@ -296,5 +332,16 @@ class TaskController
         'calculated_at' => date('Y-m-d H:i:s'),
       ]
     );
+  }
+
+  private function recalcPerformanceForTask(Task $task): void
+  {
+    $score = TaskScore::query()->where('task_id', $task->id)->first();
+    if (!$score || !$score->created_at) {
+      $this->updatePerformance((int) $task->user_id);
+      return;
+    }
+    $date = new DateTimeImmutable($score->created_at);
+    $this->updatePerformance((int) $task->user_id, (int) $date->format('Y'), (int) $date->format('m'));
   }
 }
