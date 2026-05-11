@@ -131,7 +131,7 @@ class TaskController
     $id = (int) ($params['id'] ?? 0);
     $input = json_decode(file_get_contents('php://input'), true);
 
-    $task = Task::query()->where('id', $id)->first();
+    $task = Task::query()->with('score')->where('id', $id)->first();
 
     if (!$task) {
       Response::error('任务不存在', 404);
@@ -139,6 +139,18 @@ class TaskController
 
     if (($user['role'] ?? 'user') !== 'admin' && (int) $task->user_id !== (int) $user['id']) {
       Response::error('无权修改此任务', 403);
+    }
+
+    $oldWeight = (int) $task->performance_weight;
+    $wasScored = (string) $task->status === 'scored';
+    $userId = (int) $task->user_id;
+    $scoreMonth = null;
+    $scoreYear = null;
+
+    if ($task->score && $task->score->created_at) {
+      $scoreDate = new DateTimeImmutable($task->score->created_at);
+      $scoreYear = (int) $scoreDate->format('Y');
+      $scoreMonth = (int) $scoreDate->format('m');
     }
 
     $title = trim((string) ($input['title'] ?? $task->title));
@@ -156,6 +168,10 @@ class TaskController
     ]);
     $task->save();
 
+    if ($wasScored && $oldWeight !== $performanceWeight && $scoreYear !== null && $scoreMonth !== null) {
+      $this->updatePerformance($userId, $scoreYear, $scoreMonth);
+    }
+
     Response::success($task->toArray(), '任务更新成功');
   }
 
@@ -163,7 +179,7 @@ class TaskController
   {
     $id = (int) ($params['id'] ?? 0);
 
-    $task = Task::query()->where('id', $id)->first();
+    $task = Task::query()->with('score')->where('id', $id)->first();
 
     if (!$task) {
       Response::error('任务不存在', 404);
@@ -173,7 +189,22 @@ class TaskController
       Response::error('无权删除此任务', 403);
     }
 
+    $userId = (int) $task->user_id;
+    $wasScored = (string) $task->status === 'scored';
+    $scoreMonth = null;
+    $scoreYear = null;
+
+    if ($task->score && $task->score->created_at) {
+      $scoreDate = new DateTimeImmutable($task->score->created_at);
+      $scoreYear = (int) $scoreDate->format('Y');
+      $scoreMonth = (int) $scoreDate->format('m');
+    }
+
     $task->delete();
+
+    if ($wasScored && $scoreYear !== null && $scoreMonth !== null) {
+      $this->updatePerformance($userId, $scoreYear, $scoreMonth);
+    }
 
     Response::success(null, '任务删除成功');
   }
@@ -189,7 +220,7 @@ class TaskController
       Response::error('无效的状态');
     }
 
-    $task = Task::query()->where('id', $id)->first();
+    $task = Task::query()->with('score')->where('id', $id)->first();
 
     if (!$task) {
       Response::error('任务不存在', 404);
@@ -199,9 +230,24 @@ class TaskController
       Response::error('无权修改此任务', 403);
     }
 
+    $oldStatus = (string) $task->status;
+    $userId = (int) $task->user_id;
+    $scoreMonth = null;
+    $scoreYear = null;
+
+    if ($task->score && $task->score->created_at) {
+      $scoreDate = new DateTimeImmutable($task->score->created_at);
+      $scoreYear = (int) $scoreDate->format('Y');
+      $scoreMonth = (int) $scoreDate->format('m');
+    }
+
     $task->status = $status;
     $task->completed_at = $status === 'completed' ? date('Y-m-d H:i:s') : null;
     $task->save();
+
+    if ($oldStatus === 'scored' && $status !== 'scored' && $scoreYear !== null && $scoreMonth !== null) {
+      $this->updatePerformance($userId, $scoreYear, $scoreMonth);
+    }
 
     Response::success($task->toArray(), '状态更新成功');
   }
@@ -225,12 +271,21 @@ class TaskController
       Response::error('任务不存在', 404);
     }
 
-    if ((string) $task->status !== 'completed') {
+    if (!in_array((string) $task->status, ['completed', 'scored'], true)) {
       Response::error('只能评分已完成的任务');
     }
 
+    $userId = (int) $task->user_id;
+    $oldScoreYear = null;
+    $oldScoreMonth = null;
+
     $existing = TaskScore::query()->where('task_id', $task->id)->first();
     if ($existing) {
+      if ($existing->created_at) {
+        $oldScoreDate = new DateTimeImmutable($existing->created_at);
+        $oldScoreYear = (int) $oldScoreDate->format('Y');
+        $oldScoreMonth = (int) $oldScoreDate->format('m');
+      }
       $existing->fill([
         'score' => $score,
         'comment' => $comment,
@@ -249,16 +304,21 @@ class TaskController
     $task->status = 'scored';
     $task->save();
 
-    // Update performance
-    $this->updatePerformance((int) $task->user_id);
+    if ($oldScoreYear !== null && $oldScoreMonth !== null) {
+      $this->updatePerformance($userId, $oldScoreYear, $oldScoreMonth);
+    } else {
+      $this->updatePerformance($userId);
+    }
 
     Response::success(null, '评分成功');
   }
 
-  private function updatePerformance(int $userId): void
+  private function updatePerformance(int $userId, ?int $year = null, ?int $month = null): void
   {
-    $year = (int) date('Y');
-    $month = (int) date('m');
+    if ($year === null || $month === null) {
+      $year = (int) date('Y');
+      $month = (int) date('m');
+    }
 
     $start = new DateTimeImmutable(sprintf('%04d-%02d-01 00:00:00', $year, $month));
     $end = $start->modify('first day of next month');
